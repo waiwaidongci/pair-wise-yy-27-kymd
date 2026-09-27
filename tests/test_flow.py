@@ -36,5 +36,37 @@ class CollationFlowTest(unittest.TestCase):
             self.db.export_collation(self.work,self.outsider)
         with self.assertRaisesRegex(DomainError,"括号"):
             self.db.align_passage(self.passage,self.w1,"文本[未闭合",9,self.owner)
+    def test_recovered_leaf_reintegration(self):
+        variant=self.db.create_variant(self.passage,self.w2,"春水东流，故人南去。","依文意拟补",self.editor,0)
+        leaf=self.db.register_leaf(self.w2,"叶三","IMG-003","故人南去。",self.editor)
+        with self.assertRaisesRegex(DomainError,"同版本同叶"):
+            self.db.register_leaf(self.w2,"叶三","IMG-004","他文。",self.editor)
+        with self.assertRaisesRegex(DomainError,"无权"):
+            self.db.register_leaf(self.w2,"叶四","IMG-005","故人。",self.reviewer)
+        blocked=self.db.passage_definitive(self.passage,self.owner)
+        self.assertEqual("blocked",blocked["status"])
+        self.assertEqual("叶三",blocked["blocks"][0]["leaf_seq"])
+        self.assertIn("乙本",blocked["blocks"][0]["source"])
+        self.assertIn("待负责人复核",blocked["blocks"][0]["reason"])
+        with self.assertRaisesRegex(DomainError,"负责人"):
+            self.db.review_leaf(leaf,self.editor,True)
+        self.assertEqual("approved",self.db.review_leaf(leaf,self.owner,True))
+        exported=self.db.export_collation(self.work,self.owner)
+        alignment=[a for a in exported["passages"][0]["alignments"] if a["witness_id"]==self.w2][0]
+        self.assertEqual("春水东流，故人南去。",alignment["aligned_text"])
+        self.assertEqual([],exported["passages"][0]["variants"])
+        archived=self.db.conn.execute("SELECT * FROM alignment_archive WHERE leaf_id=?",(leaf,)).fetchall()
+        self.assertEqual(1,len(archived))
+        self.assertIn("[缺页]",archived[0]["aligned_text"])
+        self.assertIn("依文意拟补",archived[0]["variants_json"])
+        self.assertEqual("ready",self.db.passage_definitive(self.passage,self.owner)["status"])
+        leaf2=self.db.register_leaf(self.w2,"叶四","IMG-006","春水东流，故人南去。",self.editor)
+        leaves={l["id"]:l for l in self.db.list_leaves(self.work,self.owner)}
+        self.assertEqual("recollation",leaves[leaf2]["status"])
+        blocked=self.db.passage_definitive(self.passage,self.owner)
+        self.assertEqual("blocked",blocked["status"])
+        self.assertIn("待重校",blocked["blocks"][0]["reason"])
+        self.db.review_leaf(leaf2,self.owner,True)
+        self.assertEqual("ready",self.db.passage_definitive(self.passage,self.owner)["status"])
 
 if __name__=="__main__": unittest.main()

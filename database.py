@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime
@@ -23,6 +24,22 @@ def validate_transcription(text: str) -> str:
     if unclosed:
         raise DomainError("校勘标记括号不匹配")
     return text
+
+
+def _clean_text(text: str) -> str:
+    """Remove bracketed collation tokens so only visible characters compare."""
+    return re.sub(r"\[[^\]]*\]", "", text)
+
+
+def _overlap_segments(a: str, b: str) -> list:
+    """Shared bigrams (or single chars for very short texts) between two clean texts."""
+    def grams(s: str) -> set:
+        if not s:
+            return set()
+        if len(s) == 1:
+            return {s}
+        return {s[i:i + 2] for i in range(len(s) - 1)}
+    return sorted(grams(a) & grams(b))
 
 
 class CollationDB:
@@ -144,8 +161,35 @@ class CollationDB:
               reason TEXT NOT NULL DEFAULT '',
               locked_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS recovered_leaves (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              witness_id INTEGER NOT NULL REFERENCES witnesses(id) ON DELETE CASCADE,
+              leaf_seq TEXT NOT NULL,
+              image_ref TEXT NOT NULL,
+              transcription TEXT NOT NULL,
+              status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','recollation','approved','rejected')),
+              overlap_json TEXT NOT NULL DEFAULT '[]',
+              created_by INTEGER NOT NULL REFERENCES users(id),
+              created_at TEXT NOT NULL,
+              reviewed_by INTEGER REFERENCES users(id),
+              reviewed_at TEXT,
+              UNIQUE(witness_id,leaf_seq)
+            );
+            CREATE TABLE IF NOT EXISTS alignment_archive (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              leaf_id INTEGER NOT NULL REFERENCES recovered_leaves(id) ON DELETE CASCADE,
+              passage_id INTEGER NOT NULL REFERENCES passages(id) ON DELETE CASCADE,
+              witness_id INTEGER NOT NULL REFERENCES witnesses(id) ON DELETE CASCADE,
+              aligned_text TEXT NOT NULL,
+              variants_json TEXT NOT NULL,
+              archived_at TEXT NOT NULL
+            );
             """
         )
+        try:
+            self.conn.execute("ALTER TABLE variants ADD COLUMN status TEXT NOT NULL DEFAULT 'current'")
+        except sqlite3.OperationalError:
+            pass
         self.conn.commit()
 
     def seed_demo(self) -> None:
@@ -379,6 +423,155 @@ class CollationDB:
                 (passage_id, user_id, reason.strip(), datetime.now().isoformat()),
             )
 
+    def register_leaf(self, witness_id: int, leaf_seq: str, image_ref: str, transcription: str, user_id: int) -> int:
+        """登记散页回补：版本、叶序、影像编号、释文。同版本同叶拒绝；与现有对齐重叠则转入待重校。"""
+        witness = self.conn.execute("SELECT * FROM witnesses WHERE id=?", (witness_id,)).fetchone()
+        if not witness:
+            raise DomainError("版本不存在")
+        if not self.can_edit_witness(witness_id, user_id):
+            raise DomainError("无权编辑该版本")
+        if not leaf_seq.strip() or not image_ref.strip():
+            raise DomainError("叶序与影像编号不能为空")
+        text = validate_transcription(transcription)
+        clean = _clean_text(text)
+        overlaps = []
+        for row in self.conn.execute(
+            "SELECT a.passage_id,a.aligned_text,p.label FROM alignments a JOIN passages p ON p.id=a.passage_id WHERE a.witness_id=?",
+            (witness_id,),
+        ).fetchall():
+            segments = _overlap_segments(clean, _clean_text(row["aligned_text"]))
+            if segments:
+                overlaps.append({"passage_id": row["passage_id"], "label": row["label"], "segments": segments})
+        status = "recollation" if overlaps else "pending"
+        with self.transaction():
+            try:
+                cur = self.conn.execute(
+                    "INSERT INTO recovered_leaves(witness_id,leaf_seq,image_ref,transcription,status,overlap_json,created_by,created_at) "
+                    "VALUES(?,?,?,?,?,?,?,?)",
+                    (witness_id, leaf_seq.strip(), image_ref.strip(), text, status,
+                     json.dumps(overlaps, ensure_ascii=False), user_id, datetime.now().isoformat()),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise DomainError("同版本同叶已有回补记录，不能重复登记") from exc
+        return int(cur.lastrowid)
+
+    def review_leaf(self, leaf_id: int, user_id: int, approve: bool) -> str:
+        """负责人复核：通过后替换该叶涉及的对齐，原对齐与旧异文结论留档。"""
+        leaf = self.conn.execute(
+            "SELECT l.*,w.work_id FROM recovered_leaves l JOIN witnesses w ON w.id=l.witness_id WHERE l.id=?", (leaf_id,)
+        ).fetchone()
+        if not leaf:
+            raise DomainError("回补记录不存在")
+        self._require_owner(leaf["work_id"], user_id)
+        if leaf["status"] in ("approved", "rejected"):
+            raise DomainError("该回补记录已完成复核")
+        now = datetime.now().isoformat()
+        with self.transaction():
+            if not approve:
+                self.conn.execute(
+                    "UPDATE recovered_leaves SET status='rejected',reviewed_by=?,reviewed_at=? WHERE id=?",
+                    (user_id, now, leaf_id),
+                )
+                return "rejected"
+            overlap_passages = {o["passage_id"] for o in json.loads(leaf["overlap_json"])}
+            for alignment in self.conn.execute(
+                "SELECT * FROM alignments WHERE witness_id=?", (leaf["witness_id"],)
+            ).fetchall():
+                has_gap = "[缺页]" in alignment["aligned_text"]
+                if not has_gap and alignment["passage_id"] not in overlap_passages:
+                    continue
+                if self.conn.execute(
+                    "SELECT 1 FROM passages WHERE id=? AND status='locked'", (alignment["passage_id"],)
+                ).fetchone():
+                    raise DomainError("段落已锁定，不能替换回补内容")
+                variants = []
+                for v in self.conn.execute(
+                    "SELECT * FROM variants WHERE passage_id=? AND witness_id=? AND status='current'",
+                    (alignment["passage_id"], leaf["witness_id"]),
+                ).fetchall():
+                    item = dict(v)
+                    item["notes"] = [dict(n) for n in self.conn.execute(
+                        "SELECT * FROM notes WHERE variant_id=? ORDER BY id", (v["id"],)).fetchall()]
+                    variants.append(item)
+                self.conn.execute(
+                    "INSERT INTO alignment_archive(leaf_id,passage_id,witness_id,aligned_text,variants_json,archived_at) "
+                    "VALUES(?,?,?,?,?,?)",
+                    (leaf_id, alignment["passage_id"], leaf["witness_id"], alignment["aligned_text"],
+                     json.dumps(variants, ensure_ascii=False), now),
+                )
+                new_text = (alignment["aligned_text"].replace("[缺页]", leaf["transcription"], 1)
+                            if has_gap else leaf["transcription"])
+                self.conn.execute("UPDATE alignments SET aligned_text=? WHERE id=?", (new_text, alignment["id"]))
+                self.conn.execute(
+                    "UPDATE variants SET status='archived' WHERE passage_id=? AND witness_id=? AND status='current'",
+                    (alignment["passage_id"], leaf["witness_id"]),
+                )
+                revision = int(self.conn.execute(
+                    "SELECT COALESCE(MAX(revision_no),0)+1 FROM revisions WHERE passage_id=?",
+                    (alignment["passage_id"],)).fetchone()[0])
+                self.conn.execute(
+                    "UPDATE passages SET revision=?,updated_by=?,updated_at=? WHERE id=?",
+                    (revision, user_id, now, alignment["passage_id"]),
+                )
+            self.conn.execute(
+                "UPDATE recovered_leaves SET status='approved',reviewed_by=?,reviewed_at=? WHERE id=?",
+                (user_id, now, leaf_id),
+            )
+        return "approved"
+
+    def list_leaves(self, work_id: int, user_id: int) -> list:
+        if not self.can_view_work(work_id, user_id):
+            raise DomainError("无权查看该作品的回补记录")
+        leaves = []
+        for row in self.conn.execute(
+            "SELECT l.*,w.siglum FROM recovered_leaves l JOIN witnesses w ON w.id=l.witness_id "
+            "WHERE w.work_id=? ORDER BY l.id", (work_id,)
+        ).fetchall():
+            item = dict(row)
+            item["overlap"] = json.loads(item.pop("overlap_json"))
+            leaves.append(item)
+        return leaves
+
+    def _passage_blocks(self, passage_id: int) -> list:
+        """阻挡定本的散页：待重校或待负责人复核，附叶序、来源与原因。"""
+        blocks = []
+        for row in self.conn.execute(
+            "SELECT l.*,w.siglum FROM recovered_leaves l JOIN witnesses w ON w.id=l.witness_id "
+            "WHERE l.status IN ('pending','recollation') AND l.witness_id IN "
+            "(SELECT witness_id FROM alignments WHERE passage_id=?) ORDER BY l.id", (passage_id,)
+        ).fetchall():
+            if row["status"] == "recollation":
+                reason = "释文与现有对齐重叠，待重校"
+            else:
+                reason = "散页回补待负责人复核"
+            blocks.append({
+                "leaf_id": row["id"],
+                "leaf_seq": row["leaf_seq"],
+                "source": f"{row['siglum']}（影像 {row['image_ref']}）",
+                "reason": reason,
+            })
+        return blocks
+
+    def passage_definitive(self, passage_id: int, user_id: int) -> dict:
+        """生成定本；还有待重校（或待复核）散页的段落拒绝生成并给出阻挡原因。"""
+        passage = self.conn.execute("SELECT * FROM passages WHERE id=?", (passage_id,)).fetchone()
+        if not passage or not self.can_view_work(passage["work_id"], user_id):
+            raise DomainError("无权查看该段落")
+        blocks = self._passage_blocks(passage_id)
+        if blocks:
+            return {"passage_id": passage_id, "label": passage["label"], "status": "blocked", "blocks": blocks}
+        apparatus = []
+        for row in self.conn.execute(
+            "SELECT v.*,w.siglum FROM variants v JOIN witnesses w ON w.id=v.witness_id "
+            "WHERE v.passage_id=? AND v.status='current' ORDER BY v.witness_id,v.layer,v.id", (passage_id,)
+        ).fetchall():
+            item = dict(row)
+            item["notes"] = [dict(n) for n in self.conn.execute(
+                "SELECT * FROM notes WHERE variant_id=? ORDER BY id", (row["id"],)).fetchall()]
+            apparatus.append(item)
+        return {"passage_id": passage_id, "label": passage["label"], "status": "ready",
+                "definitive_text": passage["base_text"], "apparatus": apparatus}
+
     def get_snapshot(self, passage_id: int, revision_no: int, user_id: int) -> dict:
         passage = self.conn.execute("SELECT work_id FROM passages WHERE id=?", (passage_id,)).fetchone()
         if not passage or not self.can_view_work(passage["work_id"], user_id):
@@ -407,12 +600,21 @@ class CollationDB:
                     gaps += 1
                 alignments.append(item)
             variants = []
-            for row in self.conn.execute("SELECT * FROM variants WHERE passage_id=? ORDER BY witness_id,layer,id", (passage["id"],)).fetchall():
+            for row in self.conn.execute("SELECT * FROM variants WHERE passage_id=? AND status='current' ORDER BY witness_id,layer,id", (passage["id"],)).fetchall():
                 variant = dict(row)
                 variant["notes"] = [dict(r) for r in self.conn.execute("SELECT * FROM notes WHERE variant_id=? ORDER BY id", (row["id"],))]
                 variants.append(variant)
-            passages.append({**dict(passage), "alignments": alignments, "variants": variants})
-        return {"work": dict(work), "witnesses": witnesses, "passages": passages, "gap_count": gaps}
+            passages.append({**dict(passage), "alignments": alignments, "variants": variants,
+                             "blocks": self._passage_blocks(passage["id"])})
+        leaves = []
+        for row in self.conn.execute(
+            "SELECT l.*,w.siglum FROM recovered_leaves l JOIN witnesses w ON w.id=l.witness_id "
+            "WHERE w.work_id=? ORDER BY l.id", (work_id,)
+        ).fetchall():
+            item = dict(row)
+            item["overlap"] = json.loads(item.pop("overlap_json"))
+            leaves.append(item)
+        return {"work": dict(work), "witnesses": witnesses, "passages": passages, "gap_count": gaps, "leaves": leaves}
 
     def snapshot(self) -> dict:
         return {
@@ -420,4 +622,6 @@ class CollationDB:
             "works": [dict(r) for r in self.conn.execute("SELECT * FROM works ORDER BY id")],
             "witnesses": [dict(r) for r in self.conn.execute("SELECT * FROM witnesses ORDER BY id")],
             "passages": [dict(r) for r in self.conn.execute("SELECT * FROM passages ORDER BY id")],
+            "leaves": [dict(r) for r in self.conn.execute(
+                "SELECT l.*,w.siglum FROM recovered_leaves l JOIN witnesses w ON w.id=l.witness_id ORDER BY l.id")],
         }

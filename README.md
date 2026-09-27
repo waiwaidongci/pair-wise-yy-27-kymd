@@ -32,3 +32,13 @@ python -m unittest discover -s tests -v
 - `GET /api/works/{id}/collation?user_id=...`
 
 导出接口把版本对齐、异文、注释、残损缺口和锁定状态组合成可复核的校勘稿。
+
+## 散页回补
+
+先前标注缺页的版本找回散页后，通过回补流程登记并替换，避免手工整段改对齐、旧拟补被当成现行结论：
+
+- `POST /api/leaves` 登记回补：版本、叶序、影像编号、释文；同版本同叶已有记录时拒绝。
+- 登记时自动比对释文与现有对齐，重叠的叶转入 `recollation`（待重校），其余为 `pending`（待复核）。
+- `POST /api/leaves/{id}/review` 由负责人复核：通过后替换该叶涉及的对齐（缺页标记处填入释文，重叠叶整叶替换），原对齐与旧异文结论写入 `alignment_archive` 留档，旧异文标记为 `archived`；驳回则标记 `rejected`。
+- `GET /api/works/{id}/leaves?user_id=...` 列出本作全部回补记录（叶序、影像编号、状态、重叠段落）。
+- `GET /api/passages/{id}/definitive?user_id=...` 生成定本；还有待重校或待复核散页的段落返回 `blocked`，并给出每叶的叶序、来源与阻挡原因。
