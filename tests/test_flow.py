@@ -36,5 +36,51 @@ class CollationFlowTest(unittest.TestCase):
             self.db.export_collation(self.work,self.outsider)
         with self.assertRaisesRegex(DomainError,"括号"):
             self.db.align_passage(self.passage,self.w1,"文本[未闭合",9,self.owner)
+    def test_recovered_leaf_review_replaces_and_archives(self):
+        variant=self.db.create_variant(self.passage,self.w2,"春水东流，故人南去。","依据缺页拟补",self.editor,0)
+        leaf=self.db.register_recovered_leaf(self.w2,self.passage,"叶三","IMG-003","春水东流，故人南去。",self.editor)
+        with self.assertRaisesRegex(DomainError,"已有回补登记"):
+            self.db.register_recovered_leaf(self.w2,self.passage,"叶三","IMG-004","他句",self.editor)
+        with self.assertRaisesRegex(DomainError,"暂不能新增异文"):
+            self.db.create_variant(self.passage,self.w2,"再补","继续拟补",self.editor,1)
+        definitive=self.db.export_definitive(self.work,self.owner)
+        self.assertFalse(definitive["can_generate"])
+        blocker=definitive["passages"][0]["blockers"][0]
+        self.assertEqual("叶三",blocker["leaf_no"]); self.assertIn("乙本",blocker["source"]); self.assertIn("待重校",blocker["reason"])
+        self.assertIsNone(definitive["passages"][0]["definitive_text"])
+        with self.assertRaisesRegex(DomainError,"不能生成定本"):
+            self.db.lock_passage(self.passage,self.owner,"定稿")
+        with self.assertRaisesRegex(DomainError,"负责人"):
+            self.db.review_recovered_leaf(leaf,self.editor)
+        self.assertEqual("applied",self.db.review_recovered_leaf(leaf,self.owner))
+        exported=self.db.export_collation(self.work,self.owner)
+        passage=exported["passages"][0]
+        self.assertEqual("春水东流，故人南去。",passage["alignments"][1]["aligned_text"])
+        self.assertEqual(0,exported["gap_count"])
+        self.assertEqual([],passage["variants"])
+        self.assertEqual(1,len(passage["archived_variants"]))
+        archives=self.db.snapshot()["alignment_archives"]
+        self.assertEqual("春水东流，[缺页]",archives[0]["aligned_text"])
+        self.assertEqual(variant,archives[0]["variants"][0]["id"])
+        with self.assertRaisesRegex(DomainError,"留档"):
+            self.db.update_variant(variant,"再改","试图改旧结论",self.editor,1)
+        definitive=self.db.export_definitive(self.work,self.owner)
+        self.assertTrue(definitive["can_generate"])
+        self.assertEqual("春水东流，故人南去。",definitive["passages"][0]["definitive_text"])
+    def test_recovered_leaf_overlap_status_and_permission(self):
+        with self.assertRaisesRegex(DomainError,"无权"):
+            self.db.register_recovered_leaf(self.w2,self.passage,"叶四","IMG-005","春水东流，故人南去。",self.outsider)
+        leaf=self.db.register_recovered_leaf(self.w2,self.passage,"叶四","IMG-005","春水东流，故人南去。",self.editor)
+        row=[l for l in self.db.snapshot()["recovered_leaves"] if l["id"]==leaf][0]
+        self.assertEqual("pending_recollate",row["status"]); self.assertEqual("春水东流，",row["overlap_text"])
+        w3=self.db.add_witness(self.work,"丙本","version")
+        leaf2=self.db.register_recovered_leaf(w3,self.passage,"叶一","IMG-009","全新一句。",self.owner)
+        row2=[l for l in self.db.snapshot()["recovered_leaves"] if l["id"]==leaf2][0]
+        self.assertEqual("pending_review",row2["status"])
+        blockers=self.db.export_definitive(self.work,self.owner)["passages"][0]["blockers"]
+        self.assertEqual("散页回补登记待负责人复核",blockers[1]["reason"])
+        self.assertEqual("applied",self.db.review_recovered_leaf(leaf2,self.owner))
+        alignments=self.db.export_collation(self.work,self.owner)["passages"][0]["alignments"]
+        self.assertEqual("全新一句。",[a for a in alignments if a["witness_id"]==w3][0]["aligned_text"])
 
 if __name__=="__main__": unittest.main()

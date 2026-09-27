@@ -27,6 +27,8 @@ class Handler(BaseHTTPRequestHandler):
                 uid=int(parse_qs(p.query).get("user_id",[0])[0]); return self._json(200,self.db.get_snapshot(int(parts[2]),int(parts[4]),uid))
             if len(parts)==4 and parts[:2]==["api","works"] and parts[3]=="collation":
                 uid=int(parse_qs(p.query).get("user_id",[0])[0]); return self._json(200,self.db.export_collation(int(parts[2]),uid))
+            if len(parts)==4 and parts[:2]==["api","works"] and parts[3]=="definitive":
+                uid=int(parse_qs(p.query).get("user_id",[0])[0]); return self._json(200,self.db.export_definitive(int(parts[2]),uid))
             self._json(404,{"ok":False,"error":"接口不存在"})
         except (DomainError,ValueError) as exc: self._json(400,{"ok":False,"error":str(exc)})
     def do_POST(self):
@@ -44,6 +46,8 @@ class Handler(BaseHTTPRequestHandler):
             if len(parts)==4 and parts[:2]==["api","variants"] and parts[3]=="revisions": return self._json(200,{"ok":True,"revision":self.db.update_variant(int(parts[2]),str(b.get("proposed_text","")),str(b.get("reason","")),int(b.get("user_id",0)),int(b.get("expected_revision",0)))})
             if path=="/api/notes": return self._json(201,{"ok":True,"id":self.db.add_note(int(b.get("variant_id",0)),str(b.get("body","")),int(b.get("user_id",0)))})
             if len(parts)==4 and parts[:2]==["api","passages"] and parts[3]=="lock": self.db.lock_passage(int(parts[2]),int(b.get("user_id",0)),str(b.get("reason",""))); return self._json(200,{"ok":True})
+            if path=="/api/leaves": return self._json(201,{"ok":True,"id":self.db.register_recovered_leaf(int(b.get("witness_id",0)),int(b.get("passage_id",0)),str(b.get("leaf_no","")),str(b.get("image_ref","")),str(b.get("transcription","")),int(b.get("user_id",0)))})
+            if len(parts)==4 and parts[:2]==["api","leaves"] and parts[3]=="review": return self._json(200,{"ok":True,"status":self.db.review_recovered_leaf(int(parts[2]),int(b.get("user_id",0)),bool(b.get("approve",True)))})
             self._json(404,{"ok":False,"error":"接口不存在"})
         except (DomainError,ValueError) as exc: self._json(400,{"ok":False,"error":str(exc)})
 def main():

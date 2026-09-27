@@ -25,6 +25,27 @@ def validate_transcription(text: str) -> str:
     return text
 
 
+def strip_special_tokens(text: str) -> str:
+    for token in SPECIAL_TOKENS:
+        text = text.replace(token, "")
+    return text
+
+
+def longest_common_part(a: str, b: str) -> str:
+    """最长公共子串，用于判断散页释文与现有对齐是否重叠。"""
+    best_len = best_end = 0
+    prev = [0] * (len(b) + 1)
+    for i in range(1, len(a) + 1):
+        cur = [0] * (len(b) + 1)
+        for j in range(1, len(b) + 1):
+            if a[i - 1] == b[j - 1]:
+                cur[j] = prev[j - 1] + 1
+                if cur[j] > best_len:
+                    best_len, best_end = cur[j], i
+        prev = cur
+    return a[best_end - best_len:best_end]
+
+
 class CollationDB:
     """SQLite-backed textual collation service with optimistic revisions."""
 
@@ -144,9 +165,43 @@ class CollationDB:
               reason TEXT NOT NULL DEFAULT '',
               locked_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS recovered_leaves (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              work_id INTEGER NOT NULL REFERENCES works(id) ON DELETE CASCADE,
+              passage_id INTEGER NOT NULL REFERENCES passages(id) ON DELETE CASCADE,
+              witness_id INTEGER NOT NULL REFERENCES witnesses(id) ON DELETE CASCADE,
+              leaf_no TEXT NOT NULL,
+              image_ref TEXT NOT NULL,
+              transcription TEXT NOT NULL,
+              overlap_text TEXT NOT NULL DEFAULT '',
+              status TEXT NOT NULL DEFAULT 'pending_review'
+                CHECK(status IN ('pending_recollate','pending_review','applied','rejected')),
+              created_by INTEGER NOT NULL REFERENCES users(id),
+              created_at TEXT NOT NULL,
+              reviewed_by INTEGER REFERENCES users(id),
+              reviewed_at TEXT,
+              UNIQUE(witness_id,leaf_no)
+            );
+            CREATE TABLE IF NOT EXISTS alignment_archives (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              leaf_id INTEGER NOT NULL REFERENCES recovered_leaves(id) ON DELETE CASCADE,
+              passage_id INTEGER NOT NULL,
+              witness_id INTEGER NOT NULL,
+              aligned_text TEXT NOT NULL,
+              sort_order INTEGER NOT NULL,
+              note TEXT NOT NULL DEFAULT '',
+              created_by INTEGER NOT NULL,
+              created_at TEXT NOT NULL,
+              variants_json TEXT NOT NULL DEFAULT '[]',
+              archived_at TEXT NOT NULL
+            );
             """
         )
         self.conn.commit()
+        variant_cols = {row[1] for row in self.conn.execute("PRAGMA table_info(variants)")}
+        if "status" not in variant_cols:
+            self.conn.execute("ALTER TABLE variants ADD COLUMN status TEXT NOT NULL DEFAULT 'current'")
+            self.conn.commit()
 
     def seed_demo(self) -> None:
         if self.conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]:
@@ -162,6 +217,7 @@ class CollationDB:
         self.align_passage(passage, w2, "春水东流，[不可辨][不可辨]。", 2, owner)
         variant = self.create_variant(passage, w2, "春水东流，故人南去。", "综合语义与行款补足", owner, 0)
         self.add_note(variant, "补字仍需参照纸背墨迹。", editor)
+        self.register_recovered_leaf(w2, passage, "叶二", "IMG-2026-017", "春水东流，故人南去。", editor)
 
     def add_user(self, name: str, role: str) -> int:
         if not name.strip() or role not in {"owner", "editor", "reviewer"}:
@@ -294,6 +350,8 @@ class CollationDB:
                 raise DomainError("取舍理由至少3个字符")
             if not self.conn.execute("SELECT 1 FROM alignments WHERE passage_id=? AND witness_id=?", (passage_id, witness_id)).fetchone():
                 raise DomainError("该版本尚未对齐此段落")
+            if self._pending_leaves(passage_id, witness_id):
+                raise DomainError("该版本存在待重校的散页回补，暂不能新增异文")
             cur = self.conn.execute(
                 "INSERT INTO variants(passage_id,witness_id,base_text,proposed_text,reason,created_by,created_at,updated_at) "
                 "VALUES(?,?,?,?,?,?,?,?)",
@@ -310,6 +368,8 @@ class CollationDB:
             variant = self.conn.execute("SELECT * FROM variants WHERE id=?", (variant_id,)).fetchone()
             if not variant:
                 raise DomainError("异文记录不存在")
+            if variant["status"] != "current":
+                raise DomainError("该异文已随散页回补留档，不能再修订")
             passage, _ = self._editable_passage(variant["passage_id"], variant["witness_id"], user_id, expected_revision)
             text = validate_transcription(proposed_text)
             if len(reason.strip()) < 3:
@@ -372,12 +432,147 @@ class CollationDB:
         if not passage:
             raise DomainError("段落不存在")
         self._require_owner(passage["work_id"], user_id)
+        if self._pending_leaves(passage_id):
+            raise DomainError("段落含待重校内容，不能生成定本")
         with self.transaction():
             self.conn.execute("UPDATE passages SET status='locked',updated_by=?,updated_at=? WHERE id=?", (user_id, datetime.now().isoformat(), passage_id))
             self.conn.execute(
                 "INSERT OR REPLACE INTO passage_locks(passage_id,locked_by,reason,locked_at) VALUES(?,?,?,?)",
                 (passage_id, user_id, reason.strip(), datetime.now().isoformat()),
             )
+
+    def register_recovered_leaf(self, witness_id: int, passage_id: int, leaf_no: str, image_ref: str,
+                                transcription: str, user_id: int) -> int:
+        """登记找回的散页：版本、叶序、影像编号、释文。与现有对齐重叠的部分先留在待重校。"""
+        passage = self.conn.execute("SELECT * FROM passages WHERE id=?", (passage_id,)).fetchone()
+        witness = self.conn.execute("SELECT * FROM witnesses WHERE id=?", (witness_id,)).fetchone()
+        if not passage or not witness or passage["work_id"] != witness["work_id"]:
+            raise DomainError("段落与版本不属于同一作品")
+        if passage["status"] == "locked" or self.conn.execute("SELECT 1 FROM passage_locks WHERE passage_id=?", (passage_id,)).fetchone():
+            raise DomainError("段落已锁定，不能登记散页回补")
+        if not self.can_edit_witness(witness_id, user_id):
+            raise DomainError("无权编辑该版本")
+        if not leaf_no.strip() or not image_ref.strip():
+            raise DomainError("叶序与影像编号不能为空")
+        text = validate_transcription(transcription)
+        existing = self.conn.execute(
+            "SELECT aligned_text FROM alignments WHERE passage_id=? AND witness_id=?", (passage_id, witness_id)
+        ).fetchone()
+        overlap = longest_common_part(strip_special_tokens(existing["aligned_text"]), strip_special_tokens(text)) if existing else ""
+        status = "pending_recollate" if overlap else "pending_review"
+        with self.transaction():
+            try:
+                cur = self.conn.execute(
+                    "INSERT INTO recovered_leaves(work_id,passage_id,witness_id,leaf_no,image_ref,transcription,overlap_text,status,created_by,created_at) "
+                    "VALUES(?,?,?,?,?,?,?,?,?,?)",
+                    (passage["work_id"], passage_id, witness_id, leaf_no.strip(), image_ref.strip(), text, overlap, status, user_id, datetime.now().isoformat()),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise DomainError("该版本此叶已有回补登记") from exc
+        return int(cur.lastrowid)
+
+    def review_recovered_leaf(self, leaf_id: int, user_id: int, approve: bool = True) -> str:
+        """负责人复核：通过才替换该叶，原对齐和旧结论留档。"""
+        leaf = self.conn.execute("SELECT * FROM recovered_leaves WHERE id=?", (leaf_id,)).fetchone()
+        if not leaf:
+            raise DomainError("散页回补记录不存在")
+        self._require_owner(leaf["work_id"], user_id)
+        if leaf["status"] not in {"pending_recollate", "pending_review"}:
+            raise DomainError("该散页已完成复核，不能重复处理")
+        now = datetime.now().isoformat()
+        with self.transaction():
+            if not approve:
+                self.conn.execute(
+                    "UPDATE recovered_leaves SET status='rejected',reviewed_by=?,reviewed_at=? WHERE id=?",
+                    (user_id, now, leaf_id),
+                )
+                return "rejected"
+            alignment = self.conn.execute(
+                "SELECT * FROM alignments WHERE passage_id=? AND witness_id=?", (leaf["passage_id"], leaf["witness_id"])
+            ).fetchone()
+            variants = [dict(r) for r in self.conn.execute(
+                "SELECT * FROM variants WHERE passage_id=? AND witness_id=? AND status='current' ORDER BY id",
+                (leaf["passage_id"], leaf["witness_id"]),
+            ).fetchall()]
+            if alignment:
+                self.conn.execute(
+                    "INSERT INTO alignment_archives(leaf_id,passage_id,witness_id,aligned_text,sort_order,note,created_by,created_at,variants_json,archived_at) "
+                    "VALUES(?,?,?,?,?,?,?,?,?,?)",
+                    (leaf_id, leaf["passage_id"], leaf["witness_id"], alignment["aligned_text"], alignment["sort_order"],
+                     alignment["note"], alignment["created_by"], alignment["created_at"], json.dumps(variants, ensure_ascii=False), now),
+                )
+                self.conn.execute(
+                    "UPDATE alignments SET aligned_text=?,note=? WHERE id=?",
+                    (leaf["transcription"], f"散页回补{leaf['leaf_no']}替换", alignment["id"]),
+                )
+            else:
+                sort_order = int(self.conn.execute(
+                    "SELECT COALESCE(MAX(sort_order),0)+1 FROM alignments WHERE passage_id=?", (leaf["passage_id"],)
+                ).fetchone()[0])
+                self.conn.execute(
+                    "INSERT INTO alignments(passage_id,witness_id,aligned_text,sort_order,note,created_by,created_at) VALUES(?,?,?,?,?,?,?)",
+                    (leaf["passage_id"], leaf["witness_id"], leaf["transcription"], sort_order, f"散页回补{leaf['leaf_no']}", user_id, now),
+                )
+            if variants:
+                self.conn.execute(
+                    "UPDATE variants SET status='archived' WHERE passage_id=? AND witness_id=? AND status='current'",
+                    (leaf["passage_id"], leaf["witness_id"]),
+                )
+            self.conn.execute(
+                "UPDATE recovered_leaves SET status='applied',reviewed_by=?,reviewed_at=? WHERE id=?",
+                (user_id, now, leaf_id),
+            )
+        return "applied"
+
+    def _pending_leaves(self, passage_id: int, witness_id: int | None = None) -> list[dict]:
+        sql = ("SELECT l.*,w.siglum,w.source_note FROM recovered_leaves l JOIN witnesses w ON w.id=l.witness_id "
+               "WHERE l.passage_id=? AND l.status IN ('pending_recollate','pending_review')")
+        params: list = [passage_id]
+        if witness_id is not None:
+            sql += " AND l.witness_id=?"
+            params.append(witness_id)
+        return [dict(r) for r in self.conn.execute(sql + " ORDER BY l.id", params).fetchall()]
+
+    def _leaf_blockers(self, passage_id: int) -> list[dict]:
+        blockers = []
+        for leaf in self._pending_leaves(passage_id):
+            reason = "散页释文与现有对齐重叠，待重校" if leaf["status"] == "pending_recollate" else "散页回补登记待负责人复核"
+            blockers.append({
+                "leaf_id": leaf["id"],
+                "leaf_no": leaf["leaf_no"],
+                "source": f"{leaf['siglum']}（{leaf['source_note'] or '来源未注明'}）",
+                "image_ref": leaf["image_ref"],
+                "reason": reason,
+            })
+        return blockers
+
+    def export_definitive(self, work_id: int, user_id: int) -> dict:
+        """生成定本：含待重校内容的段落被阻挡，并给出叶序、来源和阻挡原因。"""
+        if not self.can_view_work(work_id, user_id):
+            raise DomainError("无权查看该校勘项目")
+        work = self.conn.execute("SELECT * FROM works WHERE id=?", (work_id,)).fetchone()
+        passages = []
+        for passage in self.conn.execute("SELECT * FROM passages WHERE work_id=? ORDER BY id", (work_id,)).fetchall():
+            blockers = self._leaf_blockers(passage["id"])
+            blocked = bool(blockers)
+            variants = [dict(r) for r in self.conn.execute(
+                "SELECT * FROM variants WHERE passage_id=? AND status='current' ORDER BY witness_id,layer,id", (passage["id"],)
+            ).fetchall()]
+            alignments = [dict(r) for r in self.conn.execute(
+                "SELECT a.*,w.siglum FROM alignments a JOIN witnesses w ON w.id=a.witness_id WHERE a.passage_id=? ORDER BY a.sort_order",
+                (passage["id"],),
+            ).fetchall()]
+            passages.append({
+                "id": passage["id"],
+                "label": passage["label"],
+                "status": passage["status"],
+                "blocked": blocked,
+                "blockers": blockers,
+                "definitive_text": None if blocked else passage["base_text"],
+                "alignments": alignments,
+                "variants": variants,
+            })
+        return {"work": dict(work), "can_generate": all(not p["blocked"] for p in passages), "passages": passages}
 
     def get_snapshot(self, passage_id: int, revision_no: int, user_id: int) -> dict:
         passage = self.conn.execute("SELECT work_id FROM passages WHERE id=?", (passage_id,)).fetchone()
@@ -407,17 +602,32 @@ class CollationDB:
                     gaps += 1
                 alignments.append(item)
             variants = []
-            for row in self.conn.execute("SELECT * FROM variants WHERE passage_id=? ORDER BY witness_id,layer,id", (passage["id"],)).fetchall():
+            for row in self.conn.execute("SELECT * FROM variants WHERE passage_id=? AND status='current' ORDER BY witness_id,layer,id", (passage["id"],)).fetchall():
                 variant = dict(row)
                 variant["notes"] = [dict(r) for r in self.conn.execute("SELECT * FROM notes WHERE variant_id=? ORDER BY id", (row["id"],))]
                 variants.append(variant)
-            passages.append({**dict(passage), "alignments": alignments, "variants": variants})
+            archived_variants = [dict(r) for r in self.conn.execute(
+                "SELECT * FROM variants WHERE passage_id=? AND status='archived' ORDER BY id", (passage["id"],)
+            ).fetchall()]
+            leaves = [dict(r) for r in self.conn.execute(
+                "SELECT l.*,w.siglum FROM recovered_leaves l JOIN witnesses w ON w.id=l.witness_id WHERE l.passage_id=? ORDER BY l.id",
+                (passage["id"],),
+            ).fetchall()]
+            passages.append({**dict(passage), "alignments": alignments, "variants": variants,
+                             "archived_variants": archived_variants, "recovered_leaves": leaves})
         return {"work": dict(work), "witnesses": witnesses, "passages": passages, "gap_count": gaps}
 
     def snapshot(self) -> dict:
+        archives = []
+        for row in self.conn.execute("SELECT * FROM alignment_archives ORDER BY id"):
+            item = dict(row)
+            item["variants"] = json.loads(item.pop("variants_json"))
+            archives.append(item)
         return {
             "users": [dict(r) for r in self.conn.execute("SELECT id,name,role FROM users ORDER BY id")],
             "works": [dict(r) for r in self.conn.execute("SELECT * FROM works ORDER BY id")],
             "witnesses": [dict(r) for r in self.conn.execute("SELECT * FROM witnesses ORDER BY id")],
             "passages": [dict(r) for r in self.conn.execute("SELECT * FROM passages ORDER BY id")],
+            "recovered_leaves": [dict(r) for r in self.conn.execute("SELECT * FROM recovered_leaves ORDER BY id")],
+            "alignment_archives": archives,
         }
